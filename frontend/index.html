@@ -1,0 +1,576 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Go — 9×9</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      font-family: "Segoe UI", system-ui, sans-serif;
+      background: #1e1e2e;
+      color: #cdd6f4;
+      display: flex;
+      justify-content: center;
+      align-items: flex-start;
+      gap: 32px;
+      padding: 40px 20px;
+      min-height: 100vh;
+    }
+
+    canvas {
+      border-radius: 6px;
+      box-shadow: 0 8px 32px rgba(0,0,0,0.6);
+      cursor: crosshair;
+      display: block;
+    }
+
+    .sidebar {
+      display: flex;
+      flex-direction: column;
+      gap: 20px;
+      min-width: 220px;
+      padding-top: 4px;
+    }
+
+    h1 { font-size: 1.6rem; font-weight: 700; letter-spacing: 0.05em; }
+
+    .card {
+      background: #313244;
+      border-radius: 10px;
+      padding: 16px 20px;
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+    }
+
+    .card h2 { font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.1em; color: #a6adc8; }
+
+    #status { font-size: 1.05rem; font-weight: 600; }
+
+    #ai-thinking {
+      display: none;
+      font-size: 0.8rem;
+      color: #f38ba8;
+      animation: pulse 1s ease-in-out infinite alternate;
+    }
+    @keyframes pulse { from { opacity: 0.4; } to { opacity: 1; } }
+
+    .capture-row { display: flex; justify-content: space-between; font-size: 0.95rem; }
+    .capture-row span { font-size: 1.2rem; font-weight: 700; }
+
+    .toggle-row { display: flex; align-items: center; gap: 10px; font-size: 0.9rem; }
+    .switch { position: relative; width: 44px; height: 24px; }
+    .switch input { opacity: 0; width: 0; height: 0; }
+    .slider {
+      position: absolute; inset: 0;
+      background: #45475a;
+      border-radius: 24px;
+      cursor: pointer;
+      transition: background 0.2s;
+    }
+    .slider::before {
+      content: "";
+      position: absolute;
+      width: 18px; height: 18px;
+      left: 3px; bottom: 3px;
+      background: #cdd6f4;
+      border-radius: 50%;
+      transition: transform 0.2s;
+    }
+    input:checked + .slider { background: #89b4fa; }
+    input:checked + .slider::before { transform: translateX(20px); }
+
+    button {
+      padding: 10px 0;
+      border: none;
+      border-radius: 8px;
+      font-size: 0.95rem;
+      font-weight: 600;
+      cursor: pointer;
+      transition: filter 0.15s;
+    }
+    button:hover { filter: brightness(1.15); }
+    #new-game { background: #a6e3a1; color: #1e1e2e; }
+    #resign    { background: #f38ba8; color: #1e1e2e; }
+
+    #score-panel {
+      display: none;
+      background: #313244;
+      border-radius: 10px;
+      padding: 16px 20px;
+    }
+    #score-panel h2 { font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.1em; color: #a6adc8; margin-bottom: 10px; }
+    #score-detail table { border-collapse: collapse; width: 100%; font-size: 0.9rem; }
+    #score-detail td, #score-detail th { padding: 4px 8px; text-align: center; }
+    #score-detail th { color: #a6adc8; font-size: 0.78rem; }
+    #score-detail tr:last-child td { padding-top: 8px; }
+
+    #error-banner {
+      display: none;
+      background: #f38ba8;
+      color: #1e1e2e;
+      padding: 10px 15px;
+      border-radius: 8px;
+      font-size: 0.9rem;
+      font-weight: 600;
+      line-height: 1.4;
+    }
+  </style>
+</head>
+<body>
+  <canvas id="board"></canvas>
+
+  <aside class="sidebar">
+    <h1>Go 9×9</h1>
+
+    <div id="error-banner"></div>
+
+    <div class="card">
+      <h2>Status</h2>
+      <div id="status">Loading…</div>
+      <div id="ai-thinking">AI is thinking…</div>
+    </div>
+
+    <div class="card">
+      <h2>Captured stones</h2>
+      <div class="capture-row">⚫ Black captured <span id="black-cap">0</span></div>
+      <div class="capture-row">⚪ White captured <span id="white-cap">0</span></div>
+    </div>
+
+    <div class="card" id="color-card">
+      <h2>You are playing as</h2>
+      <div class="toggle-row">
+        ⚫
+        <label class="switch">
+          <input type="checkbox" id="color-toggle" />
+          <span class="slider"></span>
+        </label>
+        ⚪
+        <span id="color-label">Playing as Black</span>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>Mode</h2>
+      <div class="toggle-row">
+        <label class="switch">
+          <input type="checkbox" id="ai-vs-ai-toggle" />
+          <span class="slider"></span>
+        </label>
+        AI vs AI
+      </div>
+    </div>
+
+    <div class="card">
+      <button id="new-game">New Game</button>
+      <button id="resign">Resign</button>
+    </div>
+
+    <div id="score-panel">
+      <h2>Final Score</h2>
+      <div id="score-detail"></div>
+    </div>
+  </aside>
+
+  <script>
+    // ==================================================================
+    // API layer - all server calls go through here
+    // ==================================================================
+    const BASE = window.location.origin;
+
+    async function apiPost(path, body) {
+      body = body || {};
+      const res = await fetch(BASE + path, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      if (!res.ok) {
+        let msg = res.statusText;
+        try {
+          const err = await res.json();
+          if (err.error) msg = err.error;
+        } catch (e) {}
+        throw new Error(msg);
+      }
+      return res.json();
+    }
+
+    async function apiGet(path) {
+      const res = await fetch(BASE + path);
+      if (!res.ok) throw new Error(res.statusText);
+      return res.json();
+    }
+
+    const api = {
+      initialize: function() { return apiPost("/initialize"); },
+      state:      function() { return apiGet("/state"); },
+      place:      function(row, col) { return apiPost("/place", { row: row, col: col }); },
+      aiMove:     function() { return apiPost("/ai_move"); },
+      resign:     function() { return apiPost("/resign"); },
+      score:      function() { return apiGet("/score"); },
+    };
+
+    // ==================================================================
+    // Board rendering
+    // ==================================================================
+    const SIZE = 9;
+    const MARGIN = 50;
+    const CELL = 60;
+    const CANVAS_PX = MARGIN * 2 + CELL * (SIZE - 1);  // 540
+    const BOARD_COLOR  = "#C8A96E";
+    const LINE_COLOR   = "#5C3D11";
+    const BLACK_STONE  = "#1a1a1a";
+    const WHITE_STONE  = "#f5f5f0";
+    const STONE_RADIUS = CELL * 0.44;
+    const STAR_POINTS  = [[2,2],[2,6],[4,4],[6,2],[6,6]];
+
+    function toPixel(r, c) {
+      return [MARGIN + c * CELL, MARGIN + r * CELL];
+    }
+
+    function toCell(px, py) {
+      const col = Math.round((px - MARGIN) / CELL);
+      const row = Math.round((py - MARGIN) / CELL);
+      if (row < 0 || row >= SIZE || col < 0 || col >= SIZE) return null;
+      const pix = toPixel(row, col);
+      if (Math.abs(px - pix[0]) > CELL / 2 || Math.abs(py - pix[1]) > CELL / 2) return null;
+      return [row, col];
+    }
+
+    function render(ctx, state) {
+      const board = state.board;
+      const last_move = state.last_move;
+
+      ctx.fillStyle = BOARD_COLOR;
+      ctx.fillRect(0, 0, CANVAS_PX, CANVAS_PX);
+
+      ctx.strokeStyle = LINE_COLOR;
+      ctx.lineWidth = 1.5;
+      for (let i = 0; i < SIZE; i++) {
+        const p = toPixel(i, i);
+        // vertical line at column i
+        const xCol = toPixel(0, i)[0];
+        ctx.beginPath();
+        ctx.moveTo(xCol, MARGIN);
+        ctx.lineTo(xCol, MARGIN + CELL * (SIZE - 1));
+        ctx.stroke();
+        // horizontal line at row i
+        const yRow = toPixel(i, 0)[1];
+        ctx.beginPath();
+        ctx.moveTo(MARGIN, yRow);
+        ctx.lineTo(MARGIN + CELL * (SIZE - 1), yRow);
+        ctx.stroke();
+      }
+
+      ctx.fillStyle = LINE_COLOR;
+      for (let k = 0; k < STAR_POINTS.length; k++) {
+        const sp = STAR_POINTS[k];
+        const pix = toPixel(sp[0], sp[1]);
+        ctx.beginPath();
+        ctx.arc(pix[0], pix[1], 4, 0, Math.PI * 2);
+        ctx.fill();
+      }
+
+      for (let r = 0; r < SIZE; r++) {
+        for (let c = 0; c < SIZE; c++) {
+          const cell = board[r][c];
+          if (cell === 0) continue;
+
+          const pix = toPixel(r, c);
+          const x = pix[0], y = pix[1];
+          const isLastMove = last_move !== null && last_move[0] === r && last_move[1] === c;
+
+          ctx.shadowColor = "rgba(0,0,0,0.35)";
+          ctx.shadowBlur = 6;
+          ctx.shadowOffsetX = 2;
+          ctx.shadowOffsetY = 2;
+
+          const grad = ctx.createRadialGradient(x - 4, y - 4, 2, x, y, STONE_RADIUS);
+          if (cell === 1) {
+            grad.addColorStop(0, "#555");
+            grad.addColorStop(1, BLACK_STONE);
+          } else {
+            grad.addColorStop(0, "#fff");
+            grad.addColorStop(1, WHITE_STONE);
+          }
+          ctx.fillStyle = grad;
+          ctx.beginPath();
+          ctx.arc(x, y, STONE_RADIUS, 0, Math.PI * 2);
+          ctx.fill();
+
+          ctx.shadowColor = "transparent";
+          ctx.shadowBlur = 0;
+
+          if (isLastMove) {
+            ctx.strokeStyle = cell === 1 ? "#e0e0e0" : "#333";
+            ctx.lineWidth = 2.5;
+            ctx.beginPath();
+            ctx.arc(x, y, STONE_RADIUS * 0.55, 0, Math.PI * 2);
+            ctx.stroke();
+          }
+        }
+      }
+    }
+
+    function renderHover(ctx, row, col, player) {
+      const pix = toPixel(row, col);
+      ctx.globalAlpha = 0.4;
+      ctx.fillStyle = player === "black" ? BLACK_STONE : WHITE_STONE;
+      ctx.beginPath();
+      ctx.arc(pix[0], pix[1], STONE_RADIUS, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.globalAlpha = 1;
+    }
+
+    // ==================================================================
+    // Main app
+    // ==================================================================
+    const canvas  = document.getElementById("board");
+    const ctx     = canvas.getContext("2d");
+    const statusEl       = document.getElementById("status");
+    const blackCapEl     = document.getElementById("black-cap");
+    const whiteCapEl     = document.getElementById("white-cap");
+    const newGameBtn     = document.getElementById("new-game");
+    const resignBtn      = document.getElementById("resign");
+    const colorToggle    = document.getElementById("color-toggle");
+    const colorLabel     = document.getElementById("color-label");
+    const aiThinkingEl   = document.getElementById("ai-thinking");
+    const scorePanel     = document.getElementById("score-panel");
+    const scoreDetail    = document.getElementById("score-detail");
+    const errorBanner    = document.getElementById("error-banner");
+    const aiVsAiToggle   = document.getElementById("ai-vs-ai-toggle");
+    const colorCard      = document.getElementById("color-card");
+
+    canvas.width  = CANVAS_PX;
+    canvas.height = CANVAS_PX;
+
+    let state = null;
+    let humanColor = "black";
+    let aiVsAi = false;
+    let busy = false;
+    let hoverCell = null;
+
+    function showError(msg) {
+      errorBanner.textContent = msg;
+      errorBanner.style.display = "block";
+    }
+    function clearError() {
+      errorBanner.style.display = "none";
+    }
+
+    function isHumanTurn() {
+      if (aiVsAi) return false;
+      return state !== null && !state.game_over && state.current_player === humanColor;
+    }
+
+    function updateSidebar() {
+      if (!state) return;
+      const player = state.current_player === "black" ? "⚫ Black" : "⚪ White";
+      if (state.game_over) {
+        const w = state.winner === "black" ? "⚫ Black" : "⚪ White";
+        statusEl.textContent = "Game over — " + w + " wins";
+      } else {
+        let msg = player + "'s turn";
+        if (!isHumanTurn()) msg += " (AI)";
+        statusEl.textContent = msg;
+      }
+      blackCapEl.textContent = String(state.captured.black);
+      whiteCapEl.textContent = String(state.captured.white);
+    }
+
+    function draw() {
+      if (!state) return;
+      render(ctx, state);
+      if (hoverCell && isHumanTurn()) {
+        renderHover(ctx, hoverCell[0], hoverCell[1], humanColor);
+      }
+    }
+
+    async function showScore() {
+      try {
+        const s = await api.score();
+        scoreDetail.innerHTML =
+          '<table>' +
+            '<tr><th></th><th>⚫ Black</th><th>⚪ White</th></tr>' +
+            '<tr><td>Stones</td><td>' + s.black_stones + '</td><td>' + s.white_stones + '</td></tr>' +
+            '<tr><td>Territory</td><td>' + s.black_territory + '</td><td>' + s.white_territory + '</td></tr>' +
+            '<tr><td><strong>Total</strong></td><td><strong>' + s.black + '</strong></td>' +
+            '<td><strong>' + s.white + ' (+2.5 komi)</strong></td></tr>' +
+            '<tr><td colspan="3"><strong>Winner: ' +
+            (s.winner === "black" ? "⚫ Black" : "⚪ White") + '</strong></td></tr>' +
+          '</table>';
+        scorePanel.style.display = "block";
+      } catch (e) {
+        showError("Could not load score: " + e.message);
+      }
+    }
+
+    async function maybeAiMove() {
+      if (!state || state.game_over || isHumanTurn() || busy) return;
+      busy = true;
+      aiThinkingEl.style.display = "inline";
+      try {
+        state = await api.aiMove();
+        draw();
+        updateSidebar();
+        if (state.game_over) {
+          await showScore();
+        } else if (aiVsAi) {
+          setTimeout(maybeAiMove, 600);
+        }
+      } catch (e) {
+        showError("AI move failed: " + e.message);
+      } finally {
+        busy = false;
+        aiThinkingEl.style.display = "none";
+      }
+    }
+
+    async function handleClick(e) {
+      if (!isHumanTurn() || busy) return;
+      const rect = canvas.getBoundingClientRect();
+      const px = e.clientX - rect.left;
+      const py = e.clientY - rect.top;
+      const cell = toCell(px, py);
+      if (!cell) return;
+      const row = cell[0], col = cell[1];
+
+      busy = true;
+      try {
+        state = await api.place(row, col);
+        hoverCell = null;
+        draw();
+        updateSidebar();
+        if (state.game_over) {
+          await showScore();
+        } else {
+          setTimeout(maybeAiMove, 100);
+        }
+      } catch (err) {
+        // Illegal move — flash red briefly
+        ctx.strokeStyle = "red";
+        ctx.lineWidth = 3;
+        const pix = toPixel(row, col);
+        ctx.beginPath();
+        ctx.arc(pix[0], pix[1], 25, 0, Math.PI * 2);
+        ctx.stroke();
+        setTimeout(draw, 400);
+      } finally {
+        busy = false;
+      }
+    }
+
+    canvas.addEventListener("mousemove", function(e) {
+      if (!isHumanTurn() || busy) return;
+      const rect = canvas.getBoundingClientRect();
+      const cell = toCell(e.clientX - rect.left, e.clientY - rect.top);
+      const changed =
+        (cell === null) !== (hoverCell === null) ||
+        (cell !== null && hoverCell !== null && (cell[0] !== hoverCell[0] || cell[1] !== hoverCell[1]));
+      if (changed) {
+        hoverCell = cell;
+        draw();
+      }
+    });
+
+    canvas.addEventListener("mouseleave", function() {
+      hoverCell = null;
+      draw();
+    });
+
+    canvas.addEventListener("click", handleClick);
+
+    newGameBtn.addEventListener("click", async function() {
+      try {
+        scorePanel.style.display = "none";
+        clearError();
+        state = await api.initialize();
+        draw();
+        updateSidebar();
+        setTimeout(maybeAiMove, 200);
+      } catch (e) {
+        showError("Failed to start new game: " + e.message);
+      }
+    });
+
+    resignBtn.addEventListener("click", async function() {
+      if (!state || state.game_over) return;
+      try {
+        state = await api.resign();
+        draw();
+        updateSidebar();
+        await showScore();
+      } catch (e) {
+        showError("Resign failed: " + e.message);
+      }
+    });
+
+    aiVsAiToggle.addEventListener("change", async function() {
+      aiVsAi = aiVsAiToggle.checked;
+      colorCard.style.display = aiVsAi ? "none" : "";
+      try {
+        scorePanel.style.display = "none";
+        clearError();
+        state = await api.initialize();
+        draw();
+        updateSidebar();
+        if (aiVsAi) setTimeout(maybeAiMove, 200);
+      } catch (e) {
+        showError("Failed to restart: " + e.message);
+      }
+    });
+
+    colorToggle.addEventListener("change", async function() {
+      humanColor = colorToggle.checked ? "white" : "black";
+      colorLabel.textContent = colorToggle.checked ? "Playing as White" : "Playing as Black";
+      try {
+        scorePanel.style.display = "none";
+        clearError();
+        state = await api.initialize();
+        draw();
+        updateSidebar();
+        setTimeout(maybeAiMove, 200);
+      } catch (e) {
+        showError("Failed to restart: " + e.message);
+      }
+    });
+
+    // Paint an empty board immediately so the user sees the grid even
+    // before the server responds (or if it's not running at all).
+    function paintEmptyBoard() {
+      const rows = [];
+      for (let i = 0; i < 9; i++) rows.push([0,0,0,0,0,0,0,0,0]);
+      render(ctx, {
+        board: rows,
+        current_player: "black",
+        captured: {black: 0, white: 0},
+        last_move: null,
+        game_over: false,
+        winner: null,
+      });
+    }
+
+    paintEmptyBoard();
+
+    // Boot: ask the server to initialize
+    (async function() {
+      try {
+        state = await api.initialize();
+        draw();
+        updateSidebar();
+        setTimeout(maybeAiMove, 200);
+      } catch (e) {
+        showError(
+          "Cannot reach server at " + BASE + ". " +
+          "Make sure you ran `python3 server.py` and visited " +
+          "http://localhost:5001 (don't double-click the HTML file)."
+        );
+        statusEl.textContent = "Server unreachable";
+      }
+    })();
+  </script>
+</body>
+</html>
