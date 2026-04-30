@@ -3,20 +3,24 @@ Flask HTTP server — thin wrapper around GoEngine.
 All game logic lives in go_engine/; this file only handles routing.
 
 Run:
-    pip install flask flask-cors
+    pip install flask
     python3 server.py
 
 Then open http://localhost:5001 in your browser. Do NOT double-click
-index.html directly — the page needs the server to be running at
+index.html directly — the page needs the server running at
 localhost:5001 so that fetch() calls to /initialize, /ai_move, etc.
 reach the engine.
+
+flask_cors is optional. The frontend is served from the same origin
+as the API, so CORS isn't required.
 """
 
 from flask import Flask, jsonify, request
 try:
     from flask_cors import CORS
 except ImportError:
-    CORS = None  # Optional — only needed if frontend is served from a different origin
+    CORS = None
+
 from go_engine import GoEngine
 from go_engine.ai import get_ai_move
 
@@ -38,10 +42,6 @@ def game_state():
         "winner": engine.winner,
     }
 
-
-# ------------------------------------------------------------------
-# Routes
-# ------------------------------------------------------------------
 
 @app.route("/")
 def index():
@@ -80,18 +80,6 @@ def ai_move():
     return jsonify(game_state())
 
 
-@app.get("/legal_moves")
-def legal_moves():
-    return jsonify({"moves": engine.get_legal_moves()})
-
-
-@app.post("/is_legal")
-def is_legal():
-    data = request.get_json()
-    row, col = int(data["row"]), int(data["col"])
-    return jsonify({"legal": engine.is_legal(row, col)})
-
-
 @app.post("/resign")
 def resign():
     engine.resign()
@@ -102,8 +90,6 @@ def resign():
 def score():
     return jsonify(engine.calculate_score())
 
-
-# ------------------------------------------------------------------
 
 if __name__ == "__main__":
     app.run(debug=False, port=5001)

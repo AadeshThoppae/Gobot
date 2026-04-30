@@ -2,25 +2,24 @@
 Board representation and low-level stone operations for a 9x9 Go board.
 
 Cell values: 0 = empty, 1 = Black, 2 = White.
-Coordinates are (row, col), both 0-indexed, row 0 = top.
-
+Coordinates are (row, col), both 0-indexed; row 0 is the top.
 
 State:
     color[i]           flat array of 81 cell values (0/1/2)
-    grid               2D view of the above (lazy property, for compatibility)
-    current_player     BLACK or WHITE
+    grid               2D view of color (lazy property)
+    parent[i]          union-find parent pointer for cell i
+    size[root]         number of stones in the group rooted at `root`
+    libs[root]         set of empty-cell indices adjacent to that group
     captured           dict mapping player -> stones captured BY that player
-    last_move          (r, c) of most recent move, or None
-    previous_grid      2D snapshot of board before last move, for Ko
+    current_player     BLACK or WHITE, whose turn it is now
+    last_move          (r, c) of the most recent placement, or None
+    previous_hash      flat-tuple snapshot of position before last move (for ko)
 
 Methods:
     place_stone(r, c)  place for current_player; updates everything
-    is_legal(r, c)     check legality (bounds, empty, suicide, Ko)
+    is_legal(r, c)     check legality (bounds, empty, suicide, ko)
     clone()            deep copy for simulation
-    snapshot()         immutable flat tuple for hashing / Ko comparison
-    get_group(r, c)    frozenset of (r,c) in the group; compat with old API
-    get_liberties(grp) frozenset of liberty (r,c); compat with old API
-    in_atari(r, c)     True if the group at (r,c) has exactly one liberty
+    snapshot()         immutable flat tuple of the position
 
 Class method:
     neighbors(r, c)    yield neighbor (r, c) within bounds
@@ -35,7 +34,9 @@ N = SIZE * SIZE  # 81
 OPPONENT = {BLACK: WHITE, WHITE: BLACK}
 
 
-# Precompute neighbor lists for every point (massive speedup vs generating tuples)
+# Precompute a list of neighbor flat-indices for every cell. Building these
+# tuples once at import is meaningfully faster than re-deriving them at every
+# placement during MCTS rollouts.
 _NEIGHBORS = [None] * N
 for _r in range(SIZE):
     for _c in range(SIZE):
@@ -47,7 +48,7 @@ for _r in range(SIZE):
         if _c < SIZE - 1: _nbrs.append(_r * SIZE + (_c + 1))
         _NEIGHBORS[_idx] = tuple(_nbrs)
 
-NEIGHBORS = _NEIGHBORS  # module-level constant
+NEIGHBORS = _NEIGHBORS
 
 
 def rc_to_idx(r, c):
@@ -60,15 +61,14 @@ def idx_to_rc(i):
 
 class Board:
     __slots__ = (
-        "color",       # list[int] length 81: 0/1/2
-        "parent",      # union-find parents
-        "size",        # group sizes (valid at roots)
-        "libs",        # dict: root_idx -> set of liberty indices
-        "captured",    # dict: BLACK/WHITE -> int
+        "color",
+        "parent",
+        "size",
+        "libs",
+        "captured",
         "current_player",
-        "previous_hash",   # hash of position before last move (for ko)
+        "previous_hash",
         "last_move",
-        # Lazy 2D view
         "_grid_cache",
         "_grid_cache_dirty",
     )
@@ -77,7 +77,7 @@ class Board:
         self.color = [EMPTY] * N
         self.parent = list(range(N))
         self.size = [1] * N
-        self.libs = {}  # only populated for stones
+        self.libs = {}  # only contains entries for cells that are stones
         self.captured = {BLACK: 0, WHITE: 0}
         self.current_player = BLACK
         self.previous_hash = None
@@ -85,6 +85,7 @@ class Board:
         self._grid_cache = None
         self._grid_cache_dirty = True
 
+    # 2D grid view (lazy — only built when something asks for it)
 
     @property
     def grid(self):
@@ -99,10 +100,10 @@ class Board:
     def _invalidate_grid(self):
         self._grid_cache_dirty = True
 
-    # Snapshots
+    # Snapshots and cloning
 
     def snapshot(self):
-        """Immutable snapshot of the board (for Ko comparison and equality)."""
+        """Immutable snapshot of the board (used for ko comparison)."""
         return tuple(self.color)
 
     def clone(self):
@@ -110,7 +111,6 @@ class Board:
         b.color = self.color[:]
         b.parent = self.parent[:]
         b.size = self.size[:]
-        # Deep copy libs (each value is a set)
         b.libs = {k: set(v) for k, v in self.libs.items()}
         b.captured = {BLACK: self.captured[BLACK], WHITE: self.captured[WHITE]}
         b.current_player = self.current_player
@@ -120,11 +120,11 @@ class Board:
         b._grid_cache_dirty = True
         return b
 
-    # Adjacency helpers
+    # Adjacency
 
     @staticmethod
     def neighbors(r, c):
-        """Yield (nr, nc) neighbors of (r, c). Preserved for compatibility."""
+        """Yield (nr, nc) neighbors of (r, c) within board bounds."""
         for nidx in NEIGHBORS[r * SIZE + c]:
             yield divmod(nidx, SIZE)
 
@@ -132,10 +132,11 @@ class Board:
 
     def find(self, i):
         p = self.parent
-        # Path compression
+        # Find root
         root = i
         while p[root] != root:
             root = p[root]
+        # Path compression: point everything along the way directly at root
         while p[i] != root:
             nxt = p[i]
             p[i] = root
@@ -143,12 +144,12 @@ class Board:
         return root
 
     def union(self, a, b):
-        """Union groups containing a and b. a, b must be same color stones."""
+        """Union the groups containing stones a and b. Must be the same color."""
         ra = self.find(a)
         rb = self.find(b)
         if ra == rb:
             return ra
-        # Merge by size (smaller into larger)
+        # Union by size: smaller group hangs off the larger one
         if self.size[ra] < self.size[rb]:
             ra, rb = rb, ra
         self.parent[rb] = ra
@@ -157,54 +158,12 @@ class Board:
         del self.libs[rb]
         return ra
 
+    # Legality check (no cloning — operates on incremental state)
 
-    # Public group/liberty queries
-
-
-    def get_group(self, r, c):
-        """Return frozenset of (r,c) in the group at (r,c), empty if not a stone."""
-        i = rc_to_idx(r, c)
-        if self.color[i] == EMPTY:
-            return frozenset()
-        root = self.find(i)
-        # Walk all stones and collect those with same root
-        result = set()
-        for j in range(N):
-            if self.color[j] != EMPTY and self.find(j) == root:
-                result.add(idx_to_rc(j))
-        return frozenset(result)
-
-    def get_liberties(self, group):
-        """Return frozenset of liberty points for given group (set of (r,c))."""
-        if not group:
-            return frozenset()
-        # Just look at one stone's root
-        r, c = next(iter(group))
-        root = self.find(rc_to_idx(r, c))
-        return frozenset(idx_to_rc(i) for i in self.libs[root])
-
-    def in_atari(self, r, c):
-        i = rc_to_idx(r, c)
-        if self.color[i] == EMPTY:
-            return False
-        root = self.find(i)
-        return len(self.libs[root]) == 1
-
-    # Fast internal APIs used by AI
-    def liberties_at_idx(self, i):
-        """Return the liberty set of the group containing stone at idx i."""
-        root = self.find(i)
-        return self.libs[root]
-
-    def lib_count_at_idx(self, i):
-        root = self.find(i)
-        return len(self.libs[root])
-
-    # Legality check
 
     def is_legal(self, r, c, player=None):
-        """
-        Fast legality check without cloning the board.
+        """Return True iff placing for `player` at (r, c) is legal.
+
         Checks: bounds, occupancy, suicide, ko.
         """
         if player is None:
@@ -217,13 +176,16 @@ class Board:
 
         opponent = OPPONENT[player]
 
-        # Check neighbors:
-        # - Any EMPTY neighbor  - the stone has a liberty immediately
-        # - Any friendly group with >1 liberty  - stone gets liberties by merging
-        # - Any opponent group with exactly 1 liberty (which must be `i`) - opponent will be captured; creates empty liberties for us
+        # The stone has at least one liberty after placement if any of these
+        # is true:
+        #   - some neighbor is empty (immediate liberty)
+        #   - some friendly neighbor's group has more than 1 liberty (we
+        #     keep them after losing `i`)
+        #   - some opponent group has exactly 1 liberty (which must be `i`),
+        #     so capturing it gives us empty cells back as liberties.
         has_empty_neighbor = False
         friendly_extra_libs = False
-        captured_roots = []  # opp groups we will capture
+        captured_roots = []
 
         opp_roots_touched = set()
         for nj in NEIGHBORS[i]:
@@ -232,92 +194,80 @@ class Board:
                 has_empty_neighbor = True
             elif c_n == player:
                 root_n = self.find(nj)
-                # After placing, this group's libs lose `i` but they still had other libs
                 if len(self.libs[root_n]) > 1:
                     friendly_extra_libs = True
-            else:  # opponent
+            else:
                 root_n = self.find(nj)
                 if root_n not in opp_roots_touched:
                     opp_roots_touched.add(root_n)
-                    # If opponent's only liberty is `i`, this capture adds liberties to us
                     if len(self.libs[root_n]) == 1:
                         captured_roots.append(root_n)
 
-        has_liberty = has_empty_neighbor or friendly_extra_libs or bool(captured_roots)
-        if not has_liberty:
+        if not (has_empty_neighbor or friendly_extra_libs or captured_roots):
             return False  # suicide
 
-        # Ko check: classic ko = capturing exactly one stone and returning
-        # to the position before the opponent's last move.
+        # Ko check: only relevant when exactly one stone is captured.
+        # In that case, simulate the resulting position and compare its
+        # hash to the position from before the previous move.
         if self.previous_hash is not None and captured_roots:
             total_captured = sum(self.size[root] for root in captured_roots)
             if total_captured == 1:
-                # Simulate the resulting color[] and compare with previous_hash.
-                # For the captured singleton we know the index because size==1
-                # and root equals the stone itself.
                 new_color = self.color[:]
                 new_color[i] = player
+                # size==1 means the root index IS the captured stone's index
                 for root in captured_roots:
-                    new_color[root] = EMPTY  # size==1 so root IS the stone
+                    new_color[root] = EMPTY
                 if tuple(new_color) == self.previous_hash:
-                    return False  # ko
+                    return False
 
         return True
 
-    def _remove_group_at_root(self, root, capturing_player):
-        """Remove all stones in the group rooted at `root`. Update neighbors' liberties."""
-        removed = []
-        for j in range(N):
-            if self.color[j] != EMPTY and self.find(j) == root:
-                removed.append(j)
+    # Placement and capture
 
+    def _remove_group_at_root(self, root, capturing_player):
+        """Remove every stone in the group rooted at `root`. Update neighbors' liberty sets."""
+        removed = [j for j in range(N)
+                   if self.color[j] != EMPTY and self.find(j) == root]
+
+        # Clear stones
         for j in removed:
             self.color[j] = EMPTY
             self.parent[j] = j
             self.size[j] = 1
 
-        # For each removed stone, add its point as a liberty to neighboring
-        # friendly-of-OTHER-color stone groups.
+        # The newly empty cells become liberties for any group adjacent to them
         for j in removed:
             for nj in NEIGHBORS[j]:
                 if self.color[nj] != EMPTY:
-                    nroot = self.find(nj)
-                    self.libs[nroot].add(j)
+                    self.libs[self.find(nj)].add(j)
 
         self.captured[capturing_player] += len(removed)
         if root in self.libs:
             del self.libs[root]
-
         self._invalidate_grid()
         return removed
 
     def place_stone(self, r, c):
-        """
-        Place a stone for current_player at (r,c). Does NOT validate legality.
-        Updates all incremental structures.
+        """Place a stone for current_player at (r, c).
+
+        Does NOT validate legality — call is_legal first if you need to check.
+        Updates all incremental data structures.
         """
         player = self.current_player
         opponent = OPPONENT[player]
         i = rc_to_idx(r, c)
 
-        # Remember previous position hash (for Ko)
+        # Snapshot position before mutating, for ko detection on next move
         self.previous_hash = self.snapshot()
 
-        # Place stone
+        # Place the stone as its own one-stone group
         self.color[i] = player
         self.parent[i] = i
         self.size[i] = 1
+        self.libs[i] = {nj for nj in NEIGHBORS[i] if self.color[nj] == EMPTY}
 
-        # Its initial liberties = empty neighbors
-        own_libs = set()
-        for nj in NEIGHBORS[i]:
-            if self.color[nj] == EMPTY:
-                own_libs.add(nj)
-        self.libs[i] = own_libs
-
-        # Neighbors of opposite color: this point is no longer a liberty for them.
-        # Friendly neighbors: union. For friendly neighbors, also remove `i`
-        # from their liberty set (they used to have `i` empty and adjacent).
+        # Tell neighbor groups they no longer have `i` as a liberty,
+        # and remember which friendly groups we'll merge with.
         opp_roots_touched = set()
         friendly_roots_touched = set()
         for nj in NEIGHBORS[i]:
@@ -325,39 +275,20 @@ class Board:
             if c_n == EMPTY:
                 continue
             root_n = self.find(nj)
+            self.libs[root_n].discard(i)
             if c_n == player:
                 friendly_roots_touched.add(root_n)
-                # Remove i from friend's libs (was empty, now filled by me)
-                self.libs[root_n].discard(i)
             else:
                 opp_roots_touched.add(root_n)
-                # Remove i from opponent's liberty set
-                self.libs[root_n].discard(i)
 
-        # Union with friendly neighbors
-        my_root = i
+        # Merge with all adjacent friendly groups
         for fr in friendly_roots_touched:
-            my_root = self.union(my_root, fr)
+            self.union(i, fr)
 
-        # Capture opponents that now have 0 liberties
-        captured_points = []
+        # Capture any opponent groups that just lost their last liberty
         for orn in opp_roots_touched:
-            # Root may have been merged away by captures of other groups?
-            # No -- we haven't captured yet. Just verify it's still a root.
-            if self.color[next(j for j in range(N) if self.find(j) == orn and self.color[j] == opponent)] == opponent \
-                if False else True:
-                pass
-            # Simpler: check directly
             if orn in self.libs and len(self.libs[orn]) == 0:
-                removed = self._remove_group_at_root(orn, player)
-                captured_points.extend(removed)
-
-        # If we captured any stones, those empty points become liberties
-        # for any adjacent groups (including our own). _remove_group_at_root
-        # handles this, but we must also recompute our own root.
-        if captured_points:
-            my_root = self.find(i)
-            # The libs have already been updated by _remove_group_at_root.
+                self._remove_group_at_root(orn, player)
 
         self.last_move = (r, c)
         self.current_player = opponent
@@ -372,22 +303,3 @@ class Board:
         for r in range(SIZE):
             rows.append(" ".join(symbols[self.color[r * SIZE + c]] for c in range(SIZE)))
         return "\n".join(rows)
-
-    # Compatibility: previous_grid property mirrors previous_hash as a 2D tuple
-    @property
-    def previous_grid(self):
-        if self.previous_hash is None:
-            return None
-        # Return same shape as old API: tuple of tuples
-        flat = self.previous_hash
-        return tuple(tuple(flat[r * SIZE + c] for c in range(SIZE)) for r in range(SIZE))
-
-    @previous_grid.setter
-    def previous_grid(self, value):
-        """For clone() / tests that set this directly."""
-        if value is None:
-            self.previous_hash = None
-        else:
-            # Value is a 2D tuple of tuples
-            flat = tuple(value[r][c] for r in range(SIZE) for c in range(SIZE))
-            self.previous_hash = flat
